@@ -536,12 +536,6 @@ void  kfree(void *p);
 
 ---
 
-## 16. 复现实验步骤（命令一览）
-
-1) 修改 `Makefile`：加入 `kern/tests`；  
-2) 在 `init.c` 中按 §8.2 调用；  
-3) 构建并运行：
-make clean && make qemu 2>&1 | tee slub_test.log
 
 
 
