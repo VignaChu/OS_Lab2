@@ -223,6 +223,327 @@ best_fit_alloc_pages(size_t n) {
 ### 异常驱动边界探测
 - **应用场景**：极简内核，内存连续只需知道上限的场景。
 - **工作原理**：OS从已知起始地址开始，不断向后尝试分配内存，直到触发异常或超出边界。
+# Lab2 — Challenge2：任意大小内存单元的 **SLUB** 分配器（设计与实现文档）
+
+> 平台：uCore (RISC-V 64)  
+> 目标：在页级分配器之上实现**小对象**分配的 SLUB（Slab Utilization By-pass）框架，支持 1B ~ 2KB 的任意大小内存单元的高效分配与释放；2KB 以上走多页分配。并给出**设计、实现细节、测试与调试记录**。
+
+---
+
+## 1. 背景与动机
+
+内核中存在大量**小对象**的频繁分配/释放，若全部使用页级分配会带来：
+- 外部碎片严重；
+- 分配/释放在临界路径上，频繁与页分配器交互成本高；
+- 元数据管理开销大。
+
+**SLUB** 设计的核心是：
+- 按**对象大小**划分多个 `kmem_cache`（size-class），每个 cache 只处理一种固定尺寸；
+- 每个 cache 由多个 **slab** 组成（本实现每 slab=1 页），在页内连续摆放等长对象；
+- **空闲对象**用“**索引链**”连接（把对象起始 4B 存下一空闲对象的**索引**）；
+- 分配/释放近似 O(1)，大幅降低碎片与元数据开销。
+
+---
+
+## 2. 总体架构（双层分配）
+
+            ┌───────────────────────────────┐
+            │  内核其他子系统 / kmalloc 家族 │
+            └──────────────▲────────────────┘
+                           │  kmalloc/kzalloc/kfree
+                     ┌──────┴─────┐
+                     │  SLUB 小对象 │   ← Challenge2 实现（≤ 2048B）
+                     └──────▲─────┘
+                            │  > 2048B 走多页
+           ┌────────────────┴─────────────────┐
+           │        页级物理内存分配器 (pmm)    │
+           └──────────────────────────────────┘
+
+- **≤ 2048B**：进入 SLUB，根据 size-class 分配到对应 cache 的某个 slab 中；
+- **> 2048B**：直接向页分配器申请 **N 页**，页首写入 `big_hdr`，释放时整页归还。
+
+---
+
+## 3. 数据结构设计
+
+### 3.1 `slub_slab`（每页一个 slab）
+
+~~~c
+struct slub_slab {
+    struct kmem_cache *cache;   // 所属 cache
+    struct slub_slab  *next;    // 挂在 cache->partial / full 上的链指针
+    uint16_t total;             // 页内可容纳对象总数
+    uint16_t inuse;             // 已分配对象数
+    uint32_t free_head;         // 空闲对象“索引链”的头 (SLUB_NIL=0xFFFFFFFF)
+    uint32_t magic;             // 0x51ab51ab，基本一致性校验
+};
+~~~
+
+- **索引链**：把每个**空闲对象起始的 4B**当作“下一空闲对象索引”。避免单独的 free-list 结点，节省元数据。
+
+### 3.2 `kmem_cache`（每个 size-class 一个）
+
+~~~c
+struct kmem_cache {
+    size_t obj_size;            // 逻辑对象大小（8..2048）
+    size_t obj_stride;          // 实际步长 (对齐到 8B，且 ≥4B 以容纳索引)
+    size_t objs_per_slab;       // 每 slab 的对象数（统计用）
+    struct slub_slab *partial;  // 未满 slab 链
+    struct slub_slab *full;     // 满 slab 链
+    struct slub_slab *empty;    // 预留，当前未使用
+};
+~~~
+
+### 3.3 size-classes 与常量
+
+- 固定 size-classes：`{8,16,32,64,128,256,512,1024,2048}`（共 9 个）。
+- 对齐：统一 **8 字节**；对象步长 `stride = align_up(max(size, 4), 8)`。
+
+### 3.4 大块头 `big_hdr`
+
+~~~c
+#define BIG_MAGIC 0xB16B00B5u
+struct big_hdr { uint32_t magic, npages; };
+~~~
+
+- 直接申请/释放整页（或多页），释放时通过 `magic` 区分大小对象路径。
+
+---
+
+## 4. 页内布局（slab 的组织方式）
+
+|<-------------------- 1 Page / 4096B -------------------->|
+
++---------------------+------------------+------------------+
+| slub_slab header | padding (8B A) | obj0 obj1 ... |
++---------------------+------------------+------------------+
+^ page base (= slab) ^ obj_base (8B 对齐)
+
+- `obj_base = ROUNDUP(slab + sizeof(slub_slab), 8)`  
+- `usable   = 4096 - (obj_base - slab)`  
+- `nobj     = usable / obj_stride  →  total`  
+
+示例（日志）：  
+`obj_off=0x20 usable=4064 → nobj: 8B=508, 16B=254, 32B=127, 64B=63, 128B=31, 256B=15, 512B=7, 1024B=3, 2048B=1`
+
+---
+
+## 5. 核心流程
+
+### 5.1 初始化 `slub_init()`
+
+- 遍历 9 个 size-class：计算 `obj_stride`、清空链表指针；
+- **按需分配**：不预先创建 slab，第一次分配时 `slab_create()`。
+
+### 5.2 分配 `slub_alloc(size)`
+
+1. `size==0` 视为 1；`size>2048` → `big_alloc` 走多页；
+2. `idx = class_index(size)` → 选中 `kmem_cache`；
+3. slab 选择：优先从 `partial` **弹出**一个 slab；若没有则 `slab_create(cache)`；
+4. 从该 slab 的 `free_head` 取出一个对象：
+   - `i = free_head`，`obj = obj_base + i*stride`；
+   - `free_head = *(uint32_t*)obj`；`inuse++`；
+5. 若 `inuse < total` → 头插回 `partial`；否则头插到 `full`；
+6. 返回 `obj`。
+
+### 5.3 释放 `slub_free(ptr)`
+
+1. `NULL` 直接返回；检查 `((big_hdr*)ptr - 1)->magic == BIG_MAGIC` → 走多页释放；
+2. 小对象：`slab = (slub_slab*)ROUNDDOWN(ptr, PGSIZE)`，断言 `slab->magic`；
+3. **先从 `partial/full` 链摘链**（避免悬挂/成环）：`cache_unlink(cache, slab)`；
+4. 头插回对象索引链：
+   - `i = ptr_to_index(slab, ptr)`；`*(uint32_t*)ptr = slab->free_head; slab->free_head = i; inuse--`；
+5. 若 `inuse==0` → `slab_destroy` 整页归还；否则回 `partial`。
+
+---
+
+## 6. 关键实现要点
+
+### 6.1 `slab_create()`（构造索引链）
+
+- 新页清零并设置：`cache`、`magic`、`next=NULL`；
+- 计算 `obj_base/usable/nobj → total`；
+- 构造索引链：`0→1→2→...→N-1→NIL`；`free_head=0, inuse=0`；
+- 记录 `objs_per_slab = nobj`（统计输出用）。
+
+### 6.2 链表操作的**原则**
+
+- **入链前**确保 `slab->next` 写好；**出链（cache_unlink）**后务必将 `slab->next=NULL`；  
+  这是避免**环/自指**的关键，否则 `check_invariants` 或压力测试会**卡死**。
+
+### 6.3 一致性检查 `slub_check_invariants(fatal)`
+
+- 采用 **Floyd 龟兔** 断环检查 `partial/full`；
+- 对 `partial`：检查 `inuse<=total` 与 **free 索引链**每个索引的合法性；  
+- 对 `full`：必须满足 `inuse==total`；
+- 设置上限 `GUARD_MAX=100000`，防止异常时死循环；
+- `fatal!=0` 时触发 `assert(0)` 直接 panic，定位问题。
+
+---
+
+## 7. API 封装
+
+- `slub_init()`：初始化 9 个 cache；
+- `slub_alloc(size_t n)` / `slub_free(void* p)`：主入口；
+- `kmalloc/kzalloc/kfree`：对外别名；
+- `slub_dump_stats(int verbose)`：统计与内碎片估算；
+- `slub_check_invariants(int fatal)`：一致性检测。
+
+---
+
+## 8. 集成与调用
+
+### 8.1 Makefile 变更（新增测试目录）
+
+在 `KSRCDIR` 中加入：`kern/tests`，例如：
+KSRCDIR += kern/init
+kern/libs
+kern/debug
+kern/driver
+kern/mm
+kern/tests
+
+### 8.2 `init.c` 中调用顺序
+
+- `pmm_init();` 初始化完页分配器后：
+- `slub_init();`
+- （可选）`slub_selftest();`
+- `run_slub_tests();`  // 我们的测试入口（见 §9）
+
+---
+
+## 9. 测试设计（覆盖正确性 & 鲁棒性）
+
+> 我们把测试分为 **T1/T2/T3** 三组，并在每组前后插入 `slub_check_invariants(0)` 进行一致性校验。所有测试均打印可截图的进度标识。
+
+### T1：基础功能 `basic`
+
+- 对每个 size-class：
+  1. 连续分配 `objs_per_slab + 2` 个对象，触发 `partial → full` 以及新 slab 创建；
+  2. 交错释放（奇偶/随机）并再次分配，验证 free-list 的正确性；
+  3. 再进行一次**全部释放**，确保 slab 可回收；
+- 期望：`invariants ok`、无泄露、日志显示 `create`/`destroy` 合理。
+
+### T2：大块 `big` 路径
+
+- 规模：`[3KB, 64KB]` 随机长度的多页块，交错分配与释放；
+- 检查：`big_hdr` 的 `npages` 与 `magic`，释放后页计数回到初始水平；
+- 期望：**不会进入小对象路径**，日志只出现 `2048` 的 class 创建（来自其它测试），`big` 自身以页为单位申请/释放。
+
+### T3：压力 `stress`（混合尺寸/顺序）
+
+- 使用多组不同的随机种子：随机在 9 个 size-class + 若干大块之间切换；
+- 控制活跃对象上限，例如保持队列长度在 `[128, 512]`；
+- 随机选择释放/分配动作，周期性调用 `slub_check_invariants(0)`；
+- 增加**超时保护**（避免异常时“看起来卡住”）：循环中计数到达阈值就中断并打印“可能异常”。
+
+#### 常见触发 Bug（实战记录）
+- **未清空 `slab->next`**：从链表摘除后没置 `NULL`，再次插入会成环，`T3` 卡死；
+- **未先摘链再回收/迁移**：`free` 之前没 `cache_unlink`，同一 slab 同时出现在 `partial/full` 两处；
+- **`free_head==NIL` 未重建**：极端情况下 free-list 被破坏，加入 `slab_rebuild_freelist(slab)` 兜底并告警；
+- **`nobj==0` 误创建**：步长过大导致 0 个对象，创建后各种越界；创建时直接判 0 并回收该页；
+
+---
+
+## 10. 代表性运行日志（可截图）
+
+> 下面给出几段关键输出（不同平台数值会略有变化，仅示意）：
+
+[slub] init 9 caches (8..2048)
+[T1] basic begin
+[slub] create: class=8 stride=8 obj_off=0x20 usable=4064 nobj=508
+[slub] create: class=16 stride=16 obj_off=0x20 usable=4064 nobj=254
+[slub] create: class=32 stride=32 obj_off=0x20 usable=4064 nobj=127
+...
+[slub] invariants ok
+[T1] basic ok
+[T2] big begin
+[slub] invariants ok
+[T2] big ok
+[T3] stress begin
+[slub] invariants ok
+[T3] stress ok
+[slub] ### run_slub_tests leave ###
+
+当检测到异常（例如 full 链中 `inuse!=total`）会打印：
+[slub] E: full but inuse!=total (class=256)
+
+---
+
+## 11. 复杂度与碎片分析
+
+- **时间复杂度**：
+  - `alloc/free`：O(1) 均摊（链表/索引头插/弹出）；
+  - `slab_create/destroy`：O(nobj) 仅在创建/回收页时发生。
+- **空间开销**：
+  - `slub_slab` 头 < 64B（RISC-V64），对象区仅额外占用每个对象起始 4B 存索引；
+  - **内部碎片**：`stride - size` 引入，对齐越大碎片越多；
+  - **外部碎片**：由页级分配器决定，但小对象层不额外产生外部碎片。
+- 我们在 `slub_dump_stats()` 中计算：
+  - `bytes_req = inuse * obj_size`  
+  - `bytes_cap = #slab * (objs_per_slab * obj_stride)`  
+  - `internal_frag = max(bytes_cap - bytes_req, 0)`
+
+---
+
+## 12. 与 SLAB 的取舍
+
+- **简化**：SLUB 放弃每 CPU/每对象的繁杂元数据与 coloring，采用更轻量的 per-cache + 索引链；
+- **更高局部性**：同类对象在页内紧凑存放；
+- **实现复杂度低**：适合教学/实验场景。
+
+---
+
+## 13. 已知限制与改进方向
+
+- **每 slab 固定为 1 页**：可以进一步支持多页 slab，提升 2KB 附近尺寸的利用率；
+- **无对象构造/析构回调**：可扩展 `kmem_cache_create()` 支持 ctor/dtor；
+- **未实现 NUMA/Per-CPU**：可扩展为 per-CPU partial 链以减少争用（本实验单核）；
+- **没有调试染色/越界守卫**：可在调试模式下对对象头尾写哨兵字节。
+
+---
+
+## 14. 结论
+
+本文在 uCore 中完成了一个**可用、轻量、可自检**的 SLUB 小对象分配器：
+- 两层分配框架（页级 + SLUB）；
+- 9 个 size-class，统一 8B 对齐；
+- O(1) 分配释放、索引链管理空闲对象；
+- 内建一致性检查与统计接口；
+- 覆盖基础/大块/压力三类测试。
+
+实践中我们多次利用 `invariants` 与“摘链→再入链”的规则修复了卡死问题，最终在 T1/T2/T3 上得到稳定输出。
+
+---
+
+## 15. 附：关键函数原型（便于查阅）
+
+~~~c
+// 初始化 / 统计
+void slub_init(void);
+void slub_dump_stats(int verbose);
+int  slub_check_invariants(int fatal);
+
+// 小对象分配 / 释放（>2KB 自动转页级）
+void *slub_alloc(size_t size);
+void  slub_free(void *p);
+
+// 通用别名
+void *kmalloc(size_t n);
+void *kzalloc(size_t n);
+void  kfree(void *p);
+~~~
+
+---
+
+## 16. 复现实验步骤（命令一览）
+
+1) 修改 `Makefile`：加入 `kern/tests`；  
+2) 在 `init.c` 中按 §8.2 调用；  
+3) 构建并运行：
+make clean && make qemu 2>&1 | tee slub_test.log
+
+
 
 # 本实验中重要的知识点
 
