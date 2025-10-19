@@ -199,6 +199,7 @@ default_free_pages(struct Page *base, size_t n) {
 ## 所用数据结构
 - `struct Page`：代表物理页框，包含多个成员：
   - `page_link`：将空闲块的起始页链接到空闲列表；
+  - 
   - `property`：仅在空闲块的起始页上有效，记录了该连续空闲块包含的页数$N$；
   - `PG_property`：用于标记该页是否为空闲块的起始页。
 - `free_list`：全局双向链表头，用于按**物理地址顺序**管理所有连续的空闲内存块；
