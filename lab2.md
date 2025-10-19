@@ -1,5 +1,8 @@
 # 练习1：理解first-fit 连续物理内存分配算法
 
+## first-fit核心思想
+First-fit 核心思想是按顺序查找空闲分区链表，将第一个大小满足需求的空闲块分配给进程，如果这个空闲块大小正好，那么就直接分配给进程，如果这个空闲块大了，就把大的那部分切分，重新作为空闲块，如果能与相邻空闲块合并，则合并为更大的空闲块。
+
 ## 核心数据结构
 FFMA的实现主要依赖于以下数据结构：
 - `struct Page`：代表物理页框，包含多个成员：
@@ -12,36 +15,172 @@ FFMA的实现主要依赖于以下数据结构：
 ## 物理内存分配过程
 **整个物理内存分配过程由以下四个核心函数协同完成：**
 1. `default_init`：
-    - **作用**：初始化 First-Fit 内存管理器；
-    - **实现过程**：
-      - 通过 `list_init(&free_list)` 初始化用于管理空闲块的双向链表头;
-      - 将 `nr_free`初始化为 0
+- **代码如下**：
+```C
+static void default_init(void) {
+    list_init(&free_list);
+    nr_free = 0;
+}
+```
+- **代码分析**：
+  - 这段代码首先将空闲链表清空，然后把空闲页数目归0，但目前还没有与物理内存联系。
 2. `default_init_memmap`：
-   1. **作用**：将一块新识别的连续物理内存区域（从 base 开始，共 n 页）作为初始空闲块加入管理。
-   2. **实现过程**：
-      1. **页初始化**：首先遍历`base`到`base+n-1`的所有页，清除其`flags`和 `property`，并将引用计数`ref`设为0。
-      2. **设置起始页**：设置`base->property = n`，并设置`base`的 `PG_property`标志。
-      3. **更新统计**：更新 `nr_free += n`。
-      4. **插入链表**：将`base`的`page_link`结构按物理地址递增的顺序插入到`free_list`中。这是确保分配和合并操作效率的关键。
+- **代码如下**：
+```C
+default_init_memmap(struct Page *base, size_t n) {
+    assert(n > 0);
+    struct Page *p = base;
+    for (; p != base + n; p ++) {
+        assert(PageReserved(p));
+        p->flags = p->property = 0;
+        set_page_ref(p, 0);
+    }
+    base->property = n;
+    SetPageProperty(base);
+    nr_free += n;
+    if (list_empty(&free_list)) {
+        list_add(&free_list, &(base->page_link));
+    } else {
+        list_entry_t* le = &free_list;
+        while ((le = list_next(le)) != &free_list) {
+            struct Page* page = le2page(le, page_link);
+            if (base < page) {
+                list_add_before(le, &(base->page_link));
+                break;
+            } else if (list_next(le) == &free_list) {
+                list_add(le, &(base->page_link));
+            }
+        }
+    }
+}
+```
+- **代码分析**：
+  - 这段代码首先判断页表项大于0，然后指向块首指针，接着把循环把每个指针的flags/property/ref 归零，允许对每项进行分配、释放等操作，然后把块首的property标为n，证明有n个连续页空闲，并标明我是空闲页块首，还把空闲页数量加n。（flags 标识页框的状态（是否保留、是否为空闲块起始页等），property 仅在空闲块起始页中记录 “连续空闲页数量”，ref 标明页框的 “被引用次数”。）
+  - 后面的if分支是将新的空闲块（以base为起始页）插入到空闲链表free_list中，并保持链表按页框的物理地址从小到大有序排列，具体的判断逻辑如下：
+    - 先判断空闲链表free_list是否为空：
+    - 若为空，直接将新空闲块的起始页base的链表节点（base->page_link）加入链表。
+    - 若链表非空，则遍历链表查找插入位置：
+    - 遍历过程中，通过le2page将链表节点转换为对应的页框page，比较base与page的物理地址（base < page表示base的地址更小）。
+      - 找到第一个地址大于base的页框节点时，将base的节点插入到该节点前面（list_add_before），保证链表按地址递增排序。
+      - 若遍历到链表末尾仍未找到更大的节点，则将base的节点插入到链表末尾（list_add）。
+      - （`le2page` 是一个宏，用于将 “链表节点指针” 转换为 “包含该节点的页框（struct Page）指针”，具体功能是已知某个 list_entry_t 类型的链表节点（le）的地址，计算出包含该节点的 struct Page 结构体的起始地址。）
 3. `default_alloc_pages`：
-   1. **作用**：实现`First-Fit`算法，分配$n$个连续的物理页框。
-   2. **实现过程**：
-      1. **遍历查找**：从`free_list`头部开始顺序遍历，查找第一个空闲块$p$，满足 $p \rightarrow property \ge n$。
-      2. **块分割**:
-         - 找到满足条件的块 $p$ 后，首先将其从`free_list`中移除
-         - 如果 $p \rightarrow property > n$（即块大小大于请求大小）：
-           - 计算剩余空闲页的起始页 $p_{new} = p + n$，其大小为 $p \rightarrow property - n$
-           - 将 $p_{new}$ 设置为新的空闲块起始页，并将其重新插入到 free_list 中（插入位置在原 $p$ 的位置）。
-      3. **返回**：更新`nr_free -= n`，清除$p$的`PG_property`标志，并返回分配到的起始页$p$。
+- **代码如下**：
+```C
+default_alloc_pages(size_t n) {
+    assert(n > 0);
+    if (n > nr_free) {
+        return NULL;
+    }
+    struct Page *page = NULL;
+    list_entry_t *le = &free_list;
+    while ((le = list_next(le)) != &free_list) {
+        struct Page *p = le2page(le, page_link);
+        if (p->property >= n) {
+            page = p;
+            break;
+        }
+    }
+    if (page != NULL) {
+        list_entry_t* prev = list_prev(&(page->page_link));
+        list_del(&(page->page_link));
+        if (page->property > n) {
+            struct Page *p = page + n;
+            p->property = page->property - n;
+            SetPageProperty(p);
+            list_add(prev, &(p->page_link));
+        }
+        nr_free -= n;
+        ClearPageProperty(page);
+    }
+    return page;
+}
+```
+- **代码分析**：
+  - 首先判断要分配的页大于0，然后判断需要分配的页数是不是大于空闲的页数，如果满足那么返回空。
+  - 然后就是找到第一个满足分配要求的块了，具体步骤如下：
+    - 首先初始化遍历变量：page 用于存储找到的空闲块起始页（初始为 NULL，表示未找到）；le 是链表遍历指针，从空闲链表头 free_list 开始。
+    - 遍历空闲链表：while 循环通过 list_next(le) 依次获取下一个链表节点，直到 le 回到链表头（表示遍历完所有空闲块）。
+    - 链表节点转页框：通过 le2page(le, page_link) 将链表节点 le 转换为对应的页框指针 p（因为 struct Page 包含 page_link 成员）。
+    - 判断空闲块大小：检查当前页框 p 的 property（空闲块大小，单位是页）是否 ≥ n。若满足，说明找到首个足够大的空闲块，将 page 指向 p 并跳出循环。
+  - 找到空闲块后，接着就是处理没用到的空闲块，具体步骤如下：
+    - 从空闲链表中删除已分配的空闲块：首先获取 page 在链表中的前一个节点（用于后续插入剩余块时保持链表有序），接着将 page 的链表节点从 free_list 中删除（避免后续分配时重复处理该块）。
+    - 分割剩余空间（若空闲块有多余）：首先判断如果空闲块大小（page->property）大于需要分配的 n 页，说明分配后有剩余空间，需将剩余部分作为新空闲块重新加入链表，接着计算剩余空间的起始页（page 是分配块的起始页，跳过 n 个页后就是剩余块的起点），然后设置剩余块的大小（原块总大小减去分配的 n 页），然后给剩余块的起始页 p 设置 PG_property 标志（标记它是新空闲块的起始页），最后将剩余块的链表节点插入到 prev 后面。
+  - 最后更新系统状态：
+    - 首先将系统总空闲页数减去分配的 n 页，确保 nr_free 始终反映真实空闲量;
+    - 然后清除 page 的 PG_property 标志（page 已被分配，不再是空闲块）。
 4. `default_free_pages`:
-   - **作用**：释放从 base 开始的 $n$ 个连续页框，并尝试与相邻的空闲块进行合并。
-   - **实现过程**：
-     1. **初始化新空闲块**：将`base`到`base + n - 1`的页初始化，设置 `base->property = n`，设置`PG_property`标志，并更新`nr_free += n`。
-     2. **有序插入**：将新空闲块`base`按物理地址顺序插入到`free_list`中。
-     3. **尝试向前合并**：检查新插入块`base`的前一个空闲块$p_{prev}$。
-        - **条件**：如果$p_{prev} + p_{prev} \rightarrow property == base$，则将两者合并。将$p_{prev} \rightarrow property$增加 `base->property`，并从链表中删除`base`。
-     4. **尝试向后合并**：检查 base（或合并后的新块）的后一个空闲块 $p_{next}$。
-        - **条件**：如果$base + base \rightarrow property == p_{next}$，则将两者合并。将`base->property`增加$p_{next} \rightarrow property$，并从链表中删除 $p_{next}$。
+- **代码如下**
+```C
+default_free_pages(struct Page *base, size_t n) {
+    assert(n > 0);
+    struct Page *p = base;
+    for (; p != base + n; p ++) {
+        assert(!PageReserved(p) && !PageProperty(p));
+        p->flags = 0;
+        set_page_ref(p, 0);
+    }
+    base->property = n;
+    SetPageProperty(base);
+    nr_free += n;
+
+    if (list_empty(&free_list)) {
+        list_add(&free_list, &(base->page_link));
+    } else {
+        list_entry_t* le = &free_list;
+        while ((le = list_next(le)) != &free_list) {
+            struct Page* page = le2page(le, page_link);
+            if (base < page) {
+                list_add_before(le, &(base->page_link));
+                break;
+            } else if (list_next(le) == &free_list) {
+                list_add(le, &(base->page_link));
+            }
+        }
+    }
+
+    list_entry_t* le = list_prev(&(base->page_link));
+    if (le != &free_list) {
+        p = le2page(le, page_link);
+        if (p + p->property == base) {
+            p->property += base->property;
+            ClearPageProperty(base);
+            list_del(&(base->page_link));
+            base = p;
+        }
+    }
+
+    le = list_next(&(base->page_link));
+    if (le != &free_list) {
+        p = le2page(le, page_link);
+        if (base + base->property == p) {
+            base->property += p->property;
+            ClearPageProperty(p);
+            list_del(&(p->page_link));
+        }
+    }
+}
+```
+- **代码分析**：
+  - 这段代码的功能是释放连续物理页并合并相邻空闲块，首先确保释放的页数不为 0。
+  - 然后遍历从 base 到 base + n 的每个页框，先通过 assert 校验：这些页框不是保留页（!PageReserved(p)，避免释放内核关键内存）且不是空闲块起始页（!PageProperty(p)，避免重复释放空闲页）。接着清除所有状态标志，并将引用计数设为 0（表示已无任何进程使用），确保后续可被重新分配。
+  - 接着将释放块的起始页 base 的 property 设为 n（表示该空闲块包含 n 个连续页），并给 base 设置 PG_property 标志（标记它是空闲块的起始页），然后将系统总空闲页数加上释放的 n 页，确保 nr_free 反映真实空闲量。
+  - 然后将空闲块插入到链表中，判断方法和上面类似，这里不再解释。
+  - 最后与前面不同的是，这步释放的空闲块可以与相邻的空闲块合并，首先获取 base 在链表中的前一个节点 le，若 le 不是链表头（即存在前序节点），通过 le2page 转换为页框 p。然后判断 p 的空闲块结束地址（p + p->property）是否等于 base 的起始地址，如果相等说明两者连续，可合并。接着更新前序块的总大小，然后清除 base 的空闲起始标志（因为它已合并到 p），从链表中删除 base 的节点，最后更新 base 为 p。如果空闲块和后面的相邻，代码与之类似我不再赘述了。
+
+## 程序在进行物理内存分配的过程以及各个函数的作用
+**前面成果总结**：
+1. 首先是物理内存分配过程：
+   - 初始化阶段：系统启动时，初始化内存管理器的核心数据结构（空闲链表、空闲页计数），为后续管理做准备。
+   - 内存映射阶段：将物理内存中可用的连续区域（非保留区域）初始化为 “空闲块”，加入空闲链表，使这些内存可被分配。
+   - 分配阶段：当进程 / 内核需要内存时，从空闲链表中查找第一个足够大的空闲块，分割并分配所需页数，更新空闲链表和计数。
+   - 释放阶段：当内存不再使用时，将其释放回空闲链表，并尝试与相邻空闲块合并（减少碎片），更新空闲链表和计数。
+2. 函数作用：
+   - `default_init()`：初始化内存管理器
+   - `default_init_memmap(struct Page *base, size_t n)`：初始化空闲内存块
+   - `default_alloc_pages(size_t n)`：分配连续物理页
+   - `default_free_pages(struct Page *base, size_t n)`：释放连续物理页
+
 ## 算法的改进空间
 **本实验中的First-Fit的算法还有很大的改进空间，具体如下表所示**
 | 改进方向 | 改进策略 | 优点 | 缺点/适用性 |
@@ -49,8 +188,7 @@ FFMA的实现主要依赖于以下数据结构：
 | **分配策略** | **Best-Fit 算法** | 尽量分配大小最接近需求的空闲块，减少内部碎片。 | 需要遍历整个空闲列表，搜索时间增加；倾向于产生大量小的外部碎片。 |
 | **分配策略** | **Next-Fit 算法** | 从上次分配结束的位置开始搜索，而非总是从列表头开始。 | 搜索分布更均匀，可能略微提高搜索效率，但碎片问题未根本解决。 |
 | **数据结构** | **分离空闲列表 (Segregated Lists)** | 为不同大小的空闲块维护独立的链表，加速查找。 | 复杂度增加，实现更复杂。 |
-| **碎片管理** | **伙伴系统 (Buddy System)** | 强制空闲块大小为 $2^k$，利用伙伴块机制高效合并和分裂内存。 | 分配和释放的时间复杂度为 $O(\log N)$；可能引入**内部碎片**（由于大小必须向上取整）。 |
-
+| **碎片管理** | **伙伴系统 (Buddy System)** | 强制空闲块大小为 $2^k$，利用伙伴块机制高效合并和分裂内存。 | 分配和释放的时间复杂度为 $O(\log N)$；可能引入**内部碎片**（由于大小必须向上取整）。  
 # 实现 Best-Fit 连续物理内存分配算法
 
 ## 算法原理
@@ -72,53 +210,52 @@ FFMA的实现主要依赖于以下数据结构：
 代码实现
 ```c
 static struct Page *
-best_fit_alloc_pages(size_t n) {
-    assert(n > 0);
-    if (n > nr_free) {
-        return NULL;
+best_fit_alloc_pages(size_t n) {                               // 申请 n 个连续页的 Best-Fit 分配函数，返回起始页指针或 NULL
+    assert(n > 0);                                            // 确保请求页数大于 0
+    if (n > nr_free) {                                        // 若请求页数超过系统空闲页总数，直接失败
+        return NULL;                                          // 返回 NULL 表示无法分配
     }
 
-    // 引入两个新变量：用于记录找到的最佳匹配块及其大小
-    struct Page *best_fit_page = NULL;
-    size_t min_property = (size_t)-1; // 初始化为最大值
+    struct Page *best_fit_page = NULL;                        // 记录当前找到的最优（最接近 n 且 >= n）的空闲块起始页
+    size_t min_property = (size_t)-1;                         // 记录最优空闲块的大小；初始化为最大值（表示还未找到）
 
-    list_entry_t *le = &free_list;
+    list_entry_t *le = &free_list;                            // 从空闲链表表头开始遍历（free_list 为链表头）
     // 1. 遍历整个空闲列表，寻找 Best-Fit 块
-    while ((le = list_next(le)) != &free_list) {
-        struct Page *p = le2page(le, page_link);
+    while ((le = list_next(le)) != &free_list) {              // 依次遍历链表中的每个空闲块节点，直到回到表头
+        struct Page *p = le2page(le, page_link);              // 由链表节点获取对应的 struct Page 指针（块的起始页）
         
         // 检查当前空闲块 p 是否最合适
-        if (p->property >= n && p->property < min_property) {
-            min_property = p->property;
-            best_fit_page = p;
+        if (p->property >= n && p->property < min_property) { // 如果块大小 >= n 且比当前最优块更小（更接近 n）
+            min_property = p->property;                       // 更新记录的最小（最接近的）空闲块大小
+            best_fit_page = p;                                // 记录当前最优块的起始页指针
         }
     }
 
     // 2. 如果找到了 Best-Fit 块
-    if (best_fit_page != NULL) {
-        struct Page *page = best_fit_page;
+    if (best_fit_page != NULL) {                              // 如果遍历后存在满足条件的块
+        struct Page *page = best_fit_page;                    // 用局部变量 page 指向选中的最佳块起始页
         
         // 3. 将 Best-Fit 块从链表中移除
-        list_entry_t* prev = list_prev(&(page->page_link));
-        list_del(&(page->page_link));
-
+        list_entry_t* prev = list_prev(&(page->page_link));   // 记录被删除节点的前一个链表位置（用于在分裂后正确插回剩余块）
+        list_del(&(page->page_link));                         // 从空闲链表中删除该空闲块的链表节点（临时移除）
+        
         // 4. 分裂：如果 Best-Fit 块有剩余空间，将分裂出的碎片插回原位
-        if (page->property > n) {
-            struct Page *p_new_free = page + n;
-            p_new_free->property = page->property - n;
-            SetPageProperty(p_new_free);
+        if (page->property > n) {                             // 如果选中块比请求大，需要分裂出剩余部分
+            struct Page *p_new_free = page + n;               // 计算剩余空闲块的起始页（起始页地址向后偏移 n 页）
+            p_new_free->property = page->property - n;        // 设置新空闲块的大小为剩余页数
+            SetPageProperty(p_new_free);                      // 将该页标记为空闲块的起始页（设置 PG_property 标志）
 
-            list_add(prev, &(p_new_free->page_link));
+            list_add(prev, &(p_new_free->page_link));         // 将分裂出的剩余空闲块插回链表（插入到原块被删除的位置）
         }
         
         // 5. 更新统计数据，并返回分配的页
-        nr_free -= n;
-        ClearPageProperty(page);
+        nr_free -= n;                                         // 减少全局空闲页计数
+        ClearPageProperty(page);                              // 清除分配块起始页的 PG_property 标志（表示该页已被分配）
         
-        return page;
+        return page;                                          // 返回已分配连续页的起始页指针
     }
     
-    return NULL;
+    return NULL;                                              // 若没有找到合适的块，返回 NULL
 }
 ```
 
@@ -311,7 +448,7 @@ best_fit_alloc_pages(size_t n) {
 * **特权级控制（U, G）：**
     * **U (User)：** 置 $1$ 表示该页允许**用户态（U Mode）**程序访问。用户态程序**只允许**访问 $U=1$ 的页面。
     * **SUM 位（Supervisor User Memory）：** S Mode 默认不能访问 $U=1$ 的页面。只有手动将 `sstatus` 寄存器的 **SUM 位设为 $1$** 时，S Mode 才能访问用户页。但出于安全，S Mode **不允许执行** $U=1$ 页面中的指令。
-    * **G (Global)：** 置 $1$ 表示该页表项是**“全局”**的，所有地址空间都包含这一项。常用于内核关键代码和数据的映射，避免地址空间切换时被 TLB 刷新。
+    * **G (Global)：** 置 $1$ 表示该页表项是**全局**的，所有地址空间都包含这一项。常用于内核关键代码和数据的映射，避免地址空间切换时被 TLB 刷新。
 * **V (Valid)：**
     * 置 $1$ 表示该页表项**合法有效**；置 $0$ 时，其余位信息将被忽略。常用于**换页机制**。
 
@@ -348,3 +485,152 @@ best_fit_alloc_pages(size_t n) {
 * **地址空间切换：**
     * OS 通过修改 `satp` 寄存器的值来指向**不同应用（进程）的页表**，从而**修改 CPU 的虚实地址映射关系**，实现进程间的地址空间切换和内存保护。
     * **ASID (Address Space Identifier)：** 虽然文本提到目前用不到，但在多任务 OS 中，ASID 用于帮助 TLB 区分不同进程的映射项，减少上下文切换时的 TLB 刷新开销。
+
+好的，我将根据您提供的关于“建立快表以加快访问效率”的文本内容，采用简洁、提炼且内容详实的格式，输出其中涉及到的 OS 核心知识点。
+
+
+## 多级页表带来的性能瓶颈
+
+* **冯诺依曼瓶颈：**
+    * **定义：** 指 CPU 的运行速度远快于物理内存的访问速度（访问一次可能需要几百个时钟周期）。
+    * **影响：** 成为数据传输速度的限制因素。
+* **地址翻译的高昂开销：**
+    * **问题：** 采用多级页表（如 Sv39 的三级页表）时，将一个**虚拟地址**转化为**物理地址**，通常需要**多次访问物理内存**（例如：Sv39 需要 3 次内存访问来遍历三级页表）。
+    * **最终开销：** 3 次页表查询 + 1 次数据访问 $= 4$ 次物理内存访问，极大地**降低了效率**。
+
+## 局部性原理
+
+* **应用基础：** 实践证明，程序的地址访问模式具有局部性，这是加速地址翻译的基础。
+* **时间局部性：**
+    * **定义：** 被访问过的地址**很有可能在不远的将来再次被访问**。
+* **空间局部性：**
+    * **定义：** 如果一个地址被访问，则该地址**附近的地址很有可能在不远的将来被访问**（通常意味着程序会顺序访问同一页内的地址）。
+
+## 快表（TLB）机制的引入
+
+* **快表 ( Translation Lookaside Buffer)：**
+    * **定义：** 位于 **CPU 内部**的硬件高速缓存，专门用于存储**近期已完成**的虚拟页号到物理页号的**映射关系**（即页表项的缓存）。
+* **工作原理：**
+    * 当 CPU 需要进行地址翻译时，首先到 **TLB 内部**查询是否存在该虚拟地址的映射。
+    * **TLB 命中）：** 如果查询到映射（由于局部性，概率很高），则可以直接获得物理地址，**无需访问物理内存**进行页表遍历，从而极大地**加快了访问效率**。
+    * **TLB 不命中：** 如果未查询到，则需要进行完整的页表遍历（多次访问物理内存），并将新的映射关系写入 TLB 供后续使用。
+
+
+好的，我将根据您提供的关于“内核初始化的修改”的详细文本，采用简洁、提炼且内容详实的格式，输出其中涉及到的 OS 核心知识点和实验步骤。
+
+## 物理地址访问模式虚拟地址访问模式**
+
+### 切换前的系统状态与核心问题
+
+* **物理内存状态：**
+    * OpenSBI 代码： $[0\text{x}80000000, 0\text{x}80200000)$。
+    * 内核代码（被 OpenSBI 加载）：从 $0\text{x}80200000$ 开始的一块连续**物理内存**。
+* **CPU 初始状态（OpenSBI 结束）：**
+    * **特权级：** S Mode。
+    * **MMU 模式：** `satp` 的 MODE 为 **Bare**（裸模式），所有地址（取指/访存）都被视为**物理地址**。
+    * **PC 寄存器：** $0\text{x}80200000$（指向内核入口）。
+* **内核代码的问题（链接脚本修改后）：**
+    * **链接地址：** 链接脚本 `BASE_ADDRESS` 被修改为**高虚拟地址** $0\text{xffffffffc0200000}$。
+    * **冲突：** 内核指令内部所有符号（函数、变量如 `bootstacktop`、`kern_init`）都被**硬编码**为 $0\text{xffffffffc0200000}$ 之后的**高虚拟地址**。
+    * **致命错误：** CPU 仍处于 Bare 模式，将这个巨大的 $0\text{xffffffffc0200000}$ 地址视为**物理地址**，导致**地址不合法（物理地址位数不足）**，引发异常。
+
+### 地址映射关系与偏移量
+
+* **解决思路：** 构造一个页表，使得 CPU 能够将内核代码内部的高虚拟地址**正确映射回**它在物理内存中的**低物理地址**。
+* **地址对应关系：**
+    * 虚拟地址（VA）：$0\text{xffffffffc0200000}$
+    * 物理地址（PA）：$0\text{x}80200000$
+* **固定偏移量：**
+    * 内核采用**固定偏移映射**：$PA = VA - \text{Offset}$。
+    * $\text{Offset} = 0\text{xffffffffc0200000} - 0\text{x}80200000 = 0\text{xffffffff40000000}$。
+    * **目标：** 通过页表映射，使 CPU 访问 VA 时，实际访问 PA。
+
+### kern_entry中虚拟地址空间建立步骤
+
+* **页表构造策略（利用大页）：**
+    * **假设：** 假定内核大小不超过 $1\text{GiB}$。
+    * **方法：** 利用三级页表的特性，将一个**三级页表项**的 $R, W, X$ 权限位设置为**非 $0$**，使其成为一个**叶子节点**，直接映射 $1\text{GiB}$ 的**大页（Giga Page）**。
+    * **映射区间：** 将虚拟地址区间 $[0\text{xffffffffc0000000}, 0\text{xffffffffffffffff}]$ 映射到物理地址区间 $[0\text{x}80000000, 0\text{xc0000000})$。
+* **步骤总结（进入虚拟内存模式）：**
+    1.  **分配和初始化页表：** 在 `.data` 段分配 $4\text{KiB}$ 内存（`boot_page_table_sv39`），并设置**最后一个页表项**为 $1\text{GiB}$ 的大页映射（`| 0xcf` 表示 $V, R, W, X, A, D$ 均为 $1$）。
+    2.  **计算页表基址：** 在汇编中计算**三级页表的物理页号（PPN）**：$\text{PPN} = (\text{VirtualAddress} - \text{Offset}) \gg 12$。
+    3.  **设置 `satp` 寄存器：** 将计算出的 PPN 和 **MODE = Sv39** ($8 \ll 60$) 写入 `satp` 寄存器。
+    4.  **刷新 TLB：** 执行 `sfence.vma` 指令，刷新 TLB 缓存，确保新的页表映射立即生效。
+    5.  **切换到虚拟地址：** 设置栈指针 $SP$（`bootstacktop`）和跳转目标 $PC$（`kern_init`）为**高虚拟地址**。
+
+### 汇编代码中的关键操作
+
+* **地址转换：** `sub t0, t0, t1`（VA 减去 $\text{Offset}$ 得到 PA）。
+* **模式设置：** `li t1, 8 << 60`（设置 MODE = Sv39）。
+* **寄存器操作：** `csrw satp, t0`（将 PPN | MODE 写入 `satp`）。
+* **栈和跳转：** 在 **MMU 开启后**，使用 `lui` 和 `jr` 指令直接跳转到高虚拟地址（`kern_init`）。
+* **启动栈分配：** 在内核的 `.data` 段分配启动栈空间（`bootstack`），并在 MMU 开启后将 $SP$ 指向其虚拟地址（`bootstacktop`）。
+
+### pmm_init函数简单流程：
+pmm_init函数，初始化物理内存管理。本函数负责把“从哪一段物理地址开始、哪一段结束”这样的原始信息，转换成内核后面可以反复使用的 Page 结构数组 + 空闲链表，并把页分配器算法（best_fit/default …） 注册进去。
+   1. 首先通过init_pmm_manager决定内存页分配的算法
+   2. 之后通过page_init定义物理页对象
+   3. 之后经过检查后给出boot页表地址，为后续分页做准备
+
+
+好的，我将根据您提供的关于“物理内存探测”和“物理内存管理的实现”的详细文本，采用简洁、提炼且内容详实的格式，输出其中涉及到的 OS 核心知识点和实验设计。
+
+
+## 物理内存探测机制
+
+* **Bootloader 职责：**
+    * **谁来探测：** 在 RISC-V 架构中，物理内存的探测由 **OpenSBI（Bootloader）** 完成。
+    * **探测内容：** 扫描包括物理内存和各种外设在内的硬件资源。
+* **DTB（Device Tree Blob）：**
+    * **格式：** 扫描结果以 **DTB** 格式保存在物理内存中的特定位置。
+    * **传递方式：** OpenSBI 将 DTB 的**物理地址**保存在 **`a1` 寄存器**中，传递给内核。
+* **DTB 的解析 (`dtb_init`)：**
+    * **步骤：** 内核入口 `kern_entry` 将 `a1` 的值保存到全局变量 `boot_dtb`。
+    * **解析：** `dtb_init` 函数将 `boot_dtb` 转换为**虚拟地址**（通过 `+ PHYSICAL_MEMORY_OFFSET`），并解析 DTB 结构，提取出 OS 将要管理的物理内存的 **`memory_base`** 和 **`memory_size`**。
+
+## QEMU 物理内存布局
+
+* **DRAM 区域：** QEMU 模拟的 RISC-V `virt` 计算机中，OS 主要关注的内存区域是末尾标记为 **DRAM** 的地址空间。
+* **默认范围：** 默认情况下，DRAM 范围为 $[0\text{x}80000000, 0\text{x}88000000)$，大小为 $128\text{MiB}$。
+* **不可用（已占用）区域：**
+    * $[0\text{x}80000000, 0\text{x}80200000)$：被 **OpenSBI** 占用。
+    * $[0\text{x}80200000, \text{KernelEnd})$：被**内核代码和数据段**占用。
+    * **注：** DTB 占用的内存（一旦读取完毕）可以被回收。
+
+## PMM 初始化与内存建图 (`page_init`)
+
+* **目标：** 确定可用的物理内存范围，并为每个物理页框分配管理结构 `struct Page`。
+* **确定 Page 结构体数组：**
+    * **计算页数 (`npage`)：** `npage = \text{maxpa} / \text{PGSIZE}`（总物理页数）。
+    * **`pages` 数组位置：** `pages = (\text{struct Page} *) \text{ROUNDUP}((\text{void} *) \text{end}, \text{PGSIZE})$。将 `struct Page` 数组放在内核代码结束（`end` 符号）后的第一个对齐页上。
+* **标记已占用页：**
+    * **保留范围：** 从 `pages[0]` 到 `pages[\text{npage} - \text{nbase} - 1]` 的所有页（覆盖 OpenSBI、内核代码、`struct Page` 数组本身）。
+    * **操作：** 对这部分页调用 `SetPageReserved(pages + i)`，将其状态标记为**保留**，不可分配。
+* **确定空闲内存：**
+    * **起始地址：** `freemem = PADDR((\text{uintptr\_t})\text{pages} + \text{sizeof}(\text{struct Page}) \times (\text{npage} - \text{nbase}))`，即 `struct Page` 数组结束后的下一个字节的物理地址。
+    * **空闲区间：通过** $[\text{ROUNDUP}(\text{freemem}, \text{PGSIZE}), \text{ROUNDDOWN}(\text{mem\_end}, \text{PGSIZE})]$公式进行运算。
+* **初始化空闲链表：** 调用 `init_memmap(\text{pa2page}(\text{mem\_begin}), \text{页数})$，将确定的空闲物理页框加入到 PMM 管理器的空闲列表中。
+
+## PMM 管理器框架 (`struct pmm_manager`)
+
+* **目的：** 采用 C 语言中类似**面向对象**的编程思路，将物理内存管理功能集中化。
+* **结构：** `struct pmm_manager` 包含一组**函数指针**（即“成员函数”）：
+    * `name`：管理器名称（例如 `default_pmm_manager`）。
+    * `init()`：初始化管理器**内部数据结构**（如空闲链表）。
+    * `init_memmap()`：**构建**空闲物理页的 `struct Page` 描述符和链表。
+    * `alloc_pages()`：实现**物理页分配算法**。
+    * `free_pages()`：实现**物理页释放算法**。
+    * `nr_free_pages()`：返回空闲页总数。
+* **实例化：** 在 `init_pmm_manager()` 中，将全局指针 `pmm_manager` 赋值为具体的实现结构体（如 `&default_pmm_manager`），从而启用特定的分配算法。
+* **封装接口：** 提供 `alloc_pages()`、`free_pages()` 等**外部接口函数**，它们内部通过调用 `pmm_manager->` 的函数指针来执行具体算法。
+* **当前任务：** 实现 `default_pmm_manager` 结构体中的所有函数指针，特别是**页面分配算法**。
+
+
+
+
+
+
+
+
+
+
