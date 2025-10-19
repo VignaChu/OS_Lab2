@@ -188,8 +188,14 @@ default_free_pages(struct Page *base, size_t n) {
 | **分配策略** | **Best-Fit 算法** | 尽量分配大小最接近需求的空闲块，减少内部碎片。 | 需要遍历整个空闲列表，搜索时间增加；倾向于产生大量小的外部碎片。 |
 | **分配策略** | **Next-Fit 算法** | 从上次分配结束的位置开始搜索，而非总是从列表头开始。 | 搜索分布更均匀，可能略微提高搜索效率，但碎片问题未根本解决。 |
 | **数据结构** | **分离空闲列表 (Segregated Lists)** | 为不同大小的空闲块维护独立的链表，加速查找。 | 复杂度增加，实现更复杂。 |
+<<<<<<< HEAD
 | **碎片管理** | **伙伴系统 (Buddy System)** | 强制空闲块大小为 $2^k$，利用伙伴块机制高效合并和分裂内存。 | 分配和释放的时间复杂度为 $O(\log N)$；可能引入**内部碎片**（由于大小必须向上取整）。  
 # 实现 Best-Fit 连续物理内存分配算法
+=======
+| **碎片管理** | **伙伴系统 (Buddy System)** | 强制空闲块大小为 $2^k$，利用伙伴块机制高效合并和分裂内存。 | 分配和释放的时间复杂度为 $O(\log N)$；可能引入**内部碎片**（由于大小必须向上取整）。 |
+
+# 练习2： 实现 Best-Fit 连续物理内存分配算法
+>>>>>>> origin/main
 
 ## 算法原理
 1. **分配原则**:Best-Fit通过**遍历**整个空闲块列表，寻找所有够大的空闲块中最**接近**请求尺寸的块。
@@ -362,6 +368,244 @@ best_fit_alloc_pages(size_t n) {                               // 申请 n 个�
 - **应用场景**：极简内核，内存连续只需知道上限的场景。
 - **工作原理**：OS从已知起始地址开始，不断向后尝试分配内存，直到触发异常或超出边界。
 
+# Challenge2：SLUB 小对象分配器  
+## 主要思想
+
+我们要解决的是**小对象（8B~2KB）分配**这件事，所以用SLUB分配搞“两层结构”：
+
+- **第一层：页级**  
+  超过 2KB 的大块就不进 SLUB，直接 `alloc_pages/free_pages`。为了 `kfree` 能稳定位回去，我们在**页首放一个头**，同时在**返回给用户的指针前**再放**一份镜像头**（双头标记），这样不怕分类错。
+
+- **第二层：小对象级（核心）**  
+  把小对象分到固定的 **size-class**：`8/16/32/64/128/256/512/1024/2048`。  
+  **每个 size-class 用 1 页做一个 slab**：页首是 `slub_slab` 头，后面切成一个个等距的小对象。  
+  空闲对象的**前 4 字节**被我们拿来当“下一跳索引”，把空闲对象串成 **free-list**。  
+  分配 = 从 `free_head` 取一个；释放 = 把对象塞回 `free_head`。
+
+- **链表管理**  
+  对每个 size-class 维护两条链：`partial`（还有空位）和 `full`（满）。  
+  取对象优先 `partial`；没有就新建 slab。slab 在“满/不满”之间切换时，在两条链里挪一下。
+
+- **稳妥性**  
+  小对象 slab 头有 `SLAB_MAGIC`；大块有 `BIG_MAGIC` 和 `BIG_FOOT_MAGIC`；释放时**优先看“p 前面的镜像头”**，再看“页首”，基本不误判。  
+  如果 free-list 被用户数据覆盖，我们会**现场重建 free-list**，避免卡死。  
+  还写了自检：链表防环、索引越界报警、统计碎片情况。
+
+## 设计文档
+
+### 1）关键数据结构
+
+下面是三块“最核心”的结构，我直接贴源码加注释：
+
+```c
+/* 每页一个 slab，放在页首。负责“这一页里”对象的统计与 free-list 头 */
+struct slub_slab {
+    struct kmem_cache *cache;   // 这页属于哪个 size-class（指向它的管理头）
+    struct slub_slab  *next;    // 把多页串起来用的单链表指针
+    uint16_t total;             // 本页对象总数（建 slab 时一次算好）
+    uint16_t inuse;             // 已分配出去的对象个数
+    uint32_t free_head;         // 空闲对象链表的“头部对象序号”（不是指针）
+    uint32_t magic;             // 固定写 SLAB_MAGIC，释放时靠它识别“这是小对象页”
+};
+
+/* 一个 size-class 的管理头：比如 64B/128B/... */
+struct kmem_cache {
+    size_t obj_size;            // 对外看到的对象大小（8/16/.../2048）
+    size_t obj_stride;          // 真实步长（>=对象大小，含对齐，至少 8B）
+    size_t objs_per_slab;       // 一页能放多少个对象（只算一次，做统计用）
+    struct slub_slab *partial;  // 还有空位的 slab 列表
+    struct slub_slab *full;     // 已经满了的 slab 列表
+    struct slub_slab *empty;    // 本实现没用（用空就直接还页）
+};
+
+/* 大块（>2KB）直接按页分配；为了能安全地 kfree，做“双头标记” */
+struct big_hdr {
+    uint32_t magic;     // BIG_MAGIC，判定“这是大块”
+    uint32_t npages;    // 连续页数，free 时要用
+    uint32_t guard;     // BIG_FOOT_MAGIC，像尾标，做额外校验
+    uint32_t _pad;      // 对齐填充
+};
+```
+2）页内布局
+|<-------------------------  4KB 一页  -------------------------->|
++-------------------+---------------------------------------------+
+|  slab 头（几十B）  |   对齐空洞   |  obj0 | obj1 | obj2 | ...     |
++-------------------+---------------------------------------------+
+                         ^ 对齐到 8B（SLUB_ALIGN）
+
+当 objN “空闲”时：objN 的前 4 字节里存“下一个空闲对象的序号”；分配出去就归用户自由使用。
+3）初始化流程 slub_init
+
+做两件事：确定 9 个 size-class；把 obj_stride 对齐好。
+```c
+void slub_init(void) {
+    for (int i = 0; i < 9; ++i) {                 // 8..2048 共 9 档
+        size_t s = size_classes[i];
+        size_t stride = align_up(                  // 至少 4B（要放 free-list 下一跳），再对齐到 8B
+            s > sizeof(uint32_t) ? s : sizeof(uint32_t), SLUB_ALIGN);
+        caches[i].obj_size      = s;
+        caches[i].obj_stride    = stride;
+        caches[i].objs_per_slab = 0;              // 第一次建 slab 时记住
+        caches[i].partial = caches[i].full = caches[i].empty = NULL;
+    }
+    cprintf("[slub] init 9 caches (8..2048)\n");
+}
+```
+4）建/销 slab（第一次用或需要扩容时）
+```c
+/* 新建一页 slab：把页首塞上 slab 头，后面的对象串成 free-list */
+
+static struct slub_slab *slab_create(struct kmem_cache *c) {
+    struct Page *pg = alloc_pages(1);             // 向伙伴系统要一页
+    if (!pg) return NULL;
+
+    void *base = page_to_kva(pg);
+    struct slub_slab *slab = (struct slub_slab *)base;
+    memset(slab, 0, sizeof(*slab));
+    slab->cache = c;
+    slab->magic = SLAB_MAGIC;
+
+    uintptr_t obj0 = (uintptr_t)slab_obj_base(slab);       // 第 1 个对象的地址
+    size_t usable = PGSIZE - (obj0 - (uintptr_t)slab);     // 剩余可用空间
+    size_t nobj   = usable / c->obj_stride;                // 能切出多少个对象
+    if (nobj == 0) { free_pages(pg, 1); return NULL; }
+
+    slab->total = (uint16_t)nobj;
+    slab->inuse = 0;
+    slab->next  = NULL;
+
+    /* 把空闲对象按“序号”串起来：0->1->2->...->NIL */
+    for (uint32_t i = 0; i < nobj; ++i) {
+        uint32_t *slot = (uint32_t *)(obj0 + c->obj_stride * i);
+        *slot = (i + 1 < nobj) ? (i + 1) : SLUB_NIL;
+    }
+    slab->free_head = 0;
+
+    if (c->objs_per_slab == 0) c->objs_per_slab = nobj;    // 记一次即可（统计用）
+    return slab;
+}
+
+/* 这一页一个都没用了，就把整页还回伙伴系统 */
+
+static void slab_destroy(struct slub_slab *slab) {
+    assert(slab->magic == SLAB_MAGIC);
+    free_pages(kva_to_page((void *)slab), 1);
+}
+```
+5）分配流程 slub_alloc
+```c
+void *slub_alloc(size_t n) {
+    if (n == 0) n = 1;                           // 0 也当 1
+    int idx = class_index(n);                    // 选 size-class（8..2048）
+    if (idx < 0) return big_alloc(n);            // 大于 2KB 直接走“大块路径”
+
+    struct kmem_cache *c = &caches[idx];
+
+    /* 先尝试从 partial 取一页；没有就 slab_create */
+    struct slub_slab *slab = cache_pop_slab_with_space(c);
+    if (!slab) return NULL;
+
+    /* free-list 被覆盖时兜底：重建链表，避免卡死 */
+    if (slab->free_head == SLUB_NIL) {
+        slab_rebuild_freelist(slab);
+    }
+
+    /* 从 free_head 弹出一个对象 */
+    uint32_t idxobj = slab->free_head;
+    void *obj = slab_index_to_ptr(slab, idxobj);
+    slab->free_head = *(uint32_t *)obj;          // 读出“下一跳序号”
+    slab->inuse++;
+
+    /* 如果这页还没满，放回 partial；满了就挂到 full */
+    if (slab->inuse < slab->total) cache_push_partial(c, slab);
+    else                           cache_push_full(c, slab);
+    return obj;
+}
+```
+补充解释：
+
+这里的时间复杂度是 O(1)：size-class 已经选好了，free_head 的弹栈也是常数。
+
+free_head==NIL 基本是“对象内容写爆了”的信号，我们选择重建一次。
+6）释放流程 slub_free
+
+释放时最容易出错的是“分不清这块内存属于谁”。我们按先镜像头、后页首、再断言这顺序来判定：
+```c
+void slub_free(void *p) {
+    if (!p) return;
+
+    /* 1) 优先看“p 前面的镜像头”——大块会走这条 */
+    struct big_hdr *h1 = (struct big_hdr *)((uint8_t *)p - sizeof(struct big_hdr));
+    if (h1->magic == BIG_MAGIC && h1->guard == BIG_FOOT_MAGIC) {
+        big_free_by_hdr(h1);
+        return;
+    }
+
+    /* 2) 看页首：可能是小对象 slab，也可能是大块的页首头 */
+    void *base = (void *)ROUNDDOWN((uintptr_t)p, PGSIZE);
+
+    /* 2.1 小对象页：按“序号”塞回 free-list 头 */
+    struct slub_slab *as_slab = (struct slub_slab *)base;
+    if (as_slab->magic == SLAB_MAGIC) {
+        struct slub_slab *slab = as_slab;
+        struct kmem_cache *c   = slab->cache;
+
+        cache_unlink(c, slab);                    // 先从原链表摘出来，避免重入
+
+        uint32_t idxobj = slab_ptr_to_index(slab, p);
+        *(uint32_t *)p  = slab->free_head;        // 写回“下一跳”
+        slab->free_head = idxobj;
+        slab->inuse--;
+
+        if (slab->inuse == 0) slab_destroy(slab); // 这一页没人用了，直接还给伙伴系统
+        else                  cache_push_partial(c, slab);
+        return;
+    }
+
+    /* 2.2 大块页首头：也能识别（兼容路径） */
+    struct big_hdr *h0 = (struct big_hdr *)base;
+    if (h0->magic == BIG_MAGIC && h0->guard == BIG_FOOT_MAGIC) {
+        big_free_by_hdr(h0);
+        return;
+    }
+
+    /* 3) 都不是：说明这个指针不是我们分出去的，直接断言 */
+    assert(0);
+}
+```
+7）大块路径（>2KB）
+```c
+static void *big_alloc(size_t n) {
+    size_t need = n + sizeof(struct big_hdr) * 2;   // 双头
+    size_t np   = (need + PGSIZE - 1) / PGSIZE;
+
+    struct Page *pg = alloc_pages(np);
+    if (!pg) return NULL;
+
+    void *base = page_to_kva(pg);
+
+    struct big_hdr *h0 = (struct big_hdr *)base;    // 页首头
+    h0->magic  = BIG_MAGIC;
+    h0->npages = (uint32_t)np;
+    h0->guard  = BIG_FOOT_MAGIC;
+
+    uint8_t *ret = (uint8_t *)base + sizeof(struct big_hdr);  // 返回给用户的指针
+
+    struct big_hdr *h1 = (struct big_hdr *)(ret - sizeof(struct big_hdr)); // 镜像头
+    *h1 = *h0;
+
+    return ret;
+}
+
+static void big_free_by_hdr(struct big_hdr *h) {
+    assert(h->magic == BIG_MAGIC && h->guard == BIG_FOOT_MAGIC);
+    uint32_t np = h->npages;
+    h->magic = 0; h->guard = 0;                                 // 清掉标记，防二次 free
+    void *base = (void *)ROUNDDOWN((uintptr_t)h, PGSIZE);
+    free_pages(kva_to_page(base), np);
+}
+```
+
 # 本实验中重要的知识点
 
 ## 物理内存与寻址基础
@@ -486,6 +730,7 @@ best_fit_alloc_pages(size_t n) {                               // 申请 n 个�
 * **地址空间切换：**
     * OS 通过修改 `satp` 寄存器的值来指向**不同应用（进程）的页表**，从而**修改 CPU 的虚实地址映射关系**，实现进程间的地址空间切换和内存保护。
     * **ASID (Address Space Identifier)：** 虽然文本提到目前用不到，但在多任务 OS 中，ASID 用于帮助 TLB 区分不同进程的映射项，减少上下文切换时的 TLB 刷新开销。
+<<<<<<< HEAD
 
 好的，我将根据您提供的关于“建立快表以加快访问效率”的文本内容，采用简洁、提炼且内容详实的格式，输出其中涉及到的 OS 核心知识点。
 
@@ -635,3 +880,5 @@ pmm_init函数，初始化物理内存管理。本函数负责把“从哪一段
 
 
 
+=======
+>>>>>>> origin/main
