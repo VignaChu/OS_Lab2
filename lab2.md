@@ -312,56 +312,241 @@ best_fit_alloc_pages(size_t n) {                               // 申请 n 个�
 | **碎片管理** | **伙伴系统 (Buddy System)** | 一种更先进的算法，强制空闲块大小为 $2^k$。其高效的合并机制（合并时间复杂度 $O(\log N)$）能最大限度地对抗外部碎片。 |
 | **数据结构** | **基于树结构的空闲列表** | 使用平衡二叉搜索树（例如，按空闲块大小排序）来代替线性链表。这样可以快速找到大小满足 $n$ 且最小的空闲块，将查找时间降为 $O(\log N)$。 |
 
-# 硬件的可用物理内存范围的获取方法
+# Challenge1：buddy system（伙伴系统）分配算法
+- **设计思想**：
+    - 与first-fit的思想不同，buddy system是以阶为单位进行内存分配，即每个内存块都必须是2的阶。
+    - 在First-Fit 我们用单链表free_list 管理所有空闲块（无论大小），无需按块大小分类，因此不需要考虑阶的限制问题。
+    - 而 Buddy 系统需要按阶区分块大小，于是我们在代码中提出了buddy_area_t的数据结构来管理阶的大小，它的核心思想是给按不同阶来定义内存块，每个变量只储存当前阶的内存块。
+    - 至于其他地方的修改则主要在内存的分配和释放方面，具体设计理念如下：
+- **内存分配**：
+  - 首先将任意页数转为最小 2 幂阶；
+  - 然后从需求阶往上找第一个可用块，
+  - 接着将高阶块拆为低阶块，
+  - 最后将分配后的多余页切为 2 幂块，放回分阶管理。
+- **内存回收**：
+  - 首先将任意释放页转为2 幂子块，
+  - 然后找到所有可合并的伙伴块，循环合并成大块，
+  - 最后将合并后的大块放入正确的阶链表。
 
-在计算机中，由于历史原因和硬件设计需求，内存空间通常被分割成多个区域：
-- **可用RAM**：操作系统可以自由使用的空间；
-- **保留区**：被固件、硬件占用或映射的区域，操作系统不能使用；
-- **ACPI结构区**：用于存放ACPI 表的物理内存区间，存储系统参数；
-- 以及其他...
-在启动后，操作系统必须知道哪些物理地址可用、哪些物理地址被保留。但OS无法提前无法提前知道这些信息，只能通过一些方法来获取。
+### 设计文档:
+1. 新增数据结构：
+```C
+typedef struct {
+    list_entry_t free_list;  // 该阶所有空闲块的双向链表（按物理地址升序）
+    size_t       nr_free;    // 该阶当前的空闲块数量（块的个数，非页数）
+} buddy_area_t;
+```
+  - 本结构体用来按阶管理内存块，其中free_list仅存储当前阶的空闲块（保证块大小统一为2^order页），避免 First-Fit 中链表混杂各种大小块的混乱，nr_free用于快速判断当前阶是否有可用块（如areas[k].nr_free > 0即表示 order=k 有空闲块），无需遍历链表，比 First-Fit 遍历整个链表找块高效。
 
-为了解决这一问题，
+```static buddy_area_t areas[MAX_ORDER + 1];  // 覆盖MIN_ORDER(0)到MAX_ORDER(14)的所有阶```
 
-## 方法一：通过固件：
-本类方法通过在操作系统内核开始运行之前引导加载程序与早期代码和固件(BIOS或UEFI)通信，获取系统内存布局信息。
-### BIOS INT 15h E820 扩展内存查询功能：
-1. **应用场景**：传统的x86/x64架构的系统；
-2. **工作原理**：
-   - 引导加载程序调用 BIOS 的 INT 15h 中断，使用 E820 功能号请求内存映射信息;
-   - BIOS 响应请求并返回**内存映射表**;
-   - 内存映射表包含一系列内存区域描述符，每个描述符包含起始地址、长度和类型（可用、保留等）;
-   - 引导程序会反复调用该功能直到获取到整个内存映射；
-### UEFI GetMemoryMap() 函数：
-1. **应用场景**：现代x86/x64架构的系统，大部分ARM64、AArch64架构的系统；
-2. **工作原理**：
-   - 引导加载程序调用 UEFI 运行时服务 `GetMemoryMap()` 函数，请求内存映射信息;
-   - UEFI 运行时服务解析 ACPI 表，获取内存映射表;
-   - 内存映射表包含一系列内存区域描述符，每个描述符包含起始地址、长度和类型（可用、保留等）;
-   - 引导程序会反复调用`ExitBootServices`直到获取到整个内存映射；
-### ACPI
-1. **应用场景**：所有支持ACPI的系统；
-2. **工作原理**：
-   - ACPI 表中包含一系列内存区域描述符，每个描述符包含起始地址、长度和类型（可用、保留等）;
-   - 可以利用ACPI表中存储的信息来获取系统内存布局信息。
-   - 固件在初始化的时候会用特定标记划分空间，其中标记为`ACPI Reclaimable`的可以进行回收，而标记为`ACPI NVS`的部分是固件用于电源管理的，不能回收与分配。
-   - 此外ACPI还提供了SRAT表格，该表格明确列出所有的物理内存范围与其所属节点ID。
-## 方法二：通过非固件方案：
-### 物理内存探测
-1. **应用场景**：教学操作系统、嵌入式原型系统以及无固件支持的裸机系统等
-2. **工作原理**：
-   - 操作系统按(＾－＾)V逐步向物理地址写入魔法值(通常为0xdeadbeef)再读回验证，若读回值一致则认为该页存在且可用；若不一致则或触发异常则认为该页无效
-### 引导参数传递
-- **应用场景**：固件不提供物理接口(如无ACPI)时
-- **工作原理**：
-  - Bootloader 在启动 OS 前，提前探测内存（可通过内存控制器、配置寄存器或探测法），然后将结果通过约定方式传递给内核。操作系统只需解析该结构体，无需再探测。
-### 硬编码内存范围
-- **应用场景**：教学实验仿真平台(如QEMU)
-- **工作原理**：
-  - 在编译的时候通过链接脚本或头文件直接写死内存起始地址与大小，操作系统直接调用这些常量初始化内存管理。无需探测。
-### 异常驱动边界探测
-- **应用场景**：极简内核，内存连续只需知道上限的场景。
-- **工作原理**：OS从已知起始地址开始，不断向后尝试分配内存，直到触发异常或超出边界。
+  - area数组下标对应不同的阶（如areas[3]对应 order=3，管理 8 页块），并且可以通过数组直接访问任意阶的free_list和nr_free，实现分配时从需求阶往上找块，释放时合并到对应阶的功能。
+
+2. 新增函数：
+- `area_init(int k)`：初始化第k阶的管理结构：初始化该阶的free_list链表，重置nr_free（块数）为 0。
+- `area_push(int k, struct Page *p)`：将块p（大小为2^k页）按物理地址升序插入第k阶的free_list，并更新该阶块数和总空闲页。
+- `area_pop(int k)`：从第k阶的free_list头部取出一个空闲块，更新该阶块数和总空闲页（无块则返回 NULL）。
+- `area_remove_block(int k, struct Page *p)`	：将块p从第k阶的free_list中删除，更新该阶块数和总空闲页（合并伙伴块时用）。
+- `buddy_index(size_t idx, size_t size)`：计算伙伴块索引：通过异或运算（idx ^ size）找到与当前块（索引idx，大小size页）相邻的同大小块索引。
+- `ilog2_floor(size_t x)`：计算x的最大 2 幂因子的阶（如x=5返回 2，因为2^2=4≤5）。
+- `ilog2_ceil(size_t x)`：计算x的最小 2 幂因子的阶（如x=5返回 3，因为2^3=8≥5）。
+- `mark_block_head(struct Page *p, size_t sz_pages)`：标记页p为空闲块头：设置p->property为块大小（sz_pages），并置PG_property标志。
+- `clear_block_head(struct Page *p)`：清除页p的空闲块头 标记：重置p->property为 0，清除PG_property标志。
+- `dump_order_stats()`：按阶打印统计信息：每个阶的块数、累计页数，以及总空闲页（如order=2有 3 块，每块 4 页，累计 12 页）。
+- `dump_free_lists()`：打印所有阶的空闲块明细：每个块的起始页索引、大小、阶、物理地址（如 “块 #1：起始页 idx=0，大小 = 4 页，order=2”）。
+
+3. 分块的实现：
+我们设计了buddy_init_memmap函数，用于将内存初始化成2的阶大小的块，具体代码如下：
+```C
+static void buddy_init_memmap(struct Page *base, size_t n) {
+    assert(n > 0);
+
+    for (size_t i = 0; i < n; i++) {
+        struct Page *pp = base + i;
+        assert(PageReserved(pp));
+        pp->flags = 0;
+        set_page_ref(pp, 0);
+        pp->property = 0;
+    }
+
+    size_t left = n;
+    size_t cur_idx = (size_t)(base - pages);
+    struct Page *p = base;
+
+    while (left > 0) {
+        int k = ilog2_floor(left);
+        while (k > MIN_ORDER && ((cur_idx & (ORDER_PAGES(k) - 1)) != 0)) k--;
+        size_t sz = ORDER_PAGES(k);
+
+        mark_block_head(p, sz);
+        area_push(k, p);
+
+        p      += sz;
+        cur_idx += sz;
+        left   -= sz;
+    }
+}
+```
+- **解释**：
+  - 前面的半部分和first-fit里的初始化方法一样，这里不过多解释，我们从初始化分块开始解释。
+  - 首先，我们记录当前没分块的页数，确保所有 n 页都被分块处理，然后利用cur_idx计算当前页与全局页数组基地址的偏移来算出索引，并设置起始地址。
+  - 然后，进入了关键循环，首先计算当前能切割的最大块数，接着确定地址满足块大小的整数倍，然后确定当前对应块的大小，并标记块头，将块插入合适大小的空闲链表。
+  - 最后，更新索引和剩余页数，继续处理后面的。
+
+4. 内存分配：
+```C
+static struct Page *buddy_alloc_pages(size_t n) {
+    assert(n > 0);
+    if (n > total_free_pages) return NULL;
+
+    int need_k = ilog2_ceil(n);
+    int src_k = -1;
+    for (int k = need_k; k <= MAX_ORDER; k++) {
+        if (!list_empty(&areas[k].free_list)) { src_k = k; break; }
+    }
+    if (src_k < 0) return NULL;
+
+    struct Page *blk = area_pop(src_k);
+    size_t blk_sz = ORDER_PAGES(src_k);
+
+    while (src_k > MIN_ORDER) {
+        size_t half = blk_sz >> 1;
+        if (half < n) break;
+        struct Page *right = blk + half;
+        mark_block_head(right, half);
+        area_push(src_k - 1, right);
+        src_k--;
+        blk_sz = half;
+    }
+
+    struct Page *ret = blk;
+    clear_block_head(blk); 
+
+    size_t remain = blk_sz - n;
+    struct Page *cur = blk + n;
+    size_t cur_idx  = (size_t)(cur - pages);
+
+    while (remain > 0) {
+        int k = ilog2_floor(remain);
+        while (k > MIN_ORDER && ((cur_idx & (ORDER_PAGES(k) - 1)) != 0)) k--;
+        size_t sz = ORDER_PAGES(k);
+        mark_block_head(cur, sz);
+        area_push(k, cur);
+        cur     += sz;
+        cur_idx += sz;
+        remain  -= sz;
+    }
+    return ret;
+}
+```
+- **解释**：
+    - 这段代码首先计算需要分配的阶数的大小，并查找对应阶的空闲链表，通过循环查找，找到了就将对应的阶数赋给src_k，并退出循环。
+    - 接着把可以用来分配的块取出来，然后在循环中不停地对半拆分，直到满足当前块阶 > 需求阶，且半块大小 ≥ n时停止拆分
+    - 拆分过程中还要把右半块放回空闲链表，并将阶数减1。
+    - 最后处理拆分后的块，拆分后的块会合并，我们要重新将它们拆分成2阶乘大小的块，首先判断块的大小大于0，接着就按照初始化一样的逻辑拆分并更新空闲块。
+
+5. 内存释放：
+```C
+static void buddy_free_pages(struct Page *base, size_t n) {
+    assert(n > 0);
+
+    struct Page *cur = base;
+    size_t cur_idx  = (size_t)(cur - pages);
+    size_t left = n;
+
+    while (left > 0) {
+        int k = ilog2_floor(left);
+        while (k > MIN_ORDER && ((cur_idx & (ORDER_PAGES(k) - 1)) != 0)) k--;
+        size_t part = ORDER_PAGES(k);     
+
+        for (size_t i = 0; i < part; i++) {
+            struct Page *pp = cur + i;
+            assert(!PageReserved(pp));
+            pp->flags = 0;
+            set_page_ref(pp, 0);
+            pp->property = 0;
+        }
+        mark_block_head(cur, part);
+
+        size_t size = part;
+        int    ok   = k;
+        while (ok < MAX_ORDER) {
+            size_t idx  = (size_t)(cur - pages);
+            size_t bidx = buddy_index(idx, size);
+            if (bidx >= npage) break;
+            struct Page *bd = pages + bidx;
+            if (!PageProperty(bd) || bd->property != size) break;
+
+            area_remove_block(ok, bd);      
+            if (bd < cur) cur = bd;        
+            size <<= 1;
+            ok++;
+            mark_block_head(cur, size);
+        }
+
+
+        area_push(ok, cur);
+
+
+        cur     = (base + (n - (left - part)));
+        cur_idx = (size_t)(cur - pages);
+        left   -= part;
+    }
+}
+```
+- **解释**：
+    - 开头还是确保释放的页数大于0，接着定义cur用于跟踪当前处理的释放区片段，确保从 base 开始的所有 n 页都被处理、cur_idx 用于检查释放区片段的地址是否对齐（Buddy 要求空闲块地址必须是块大小的整数倍）、left 确保所有释放页都被转换为空闲块，避免遗漏。
+    - 然后通过调用ilog2_floor计算释放的块对应的阶，并判断当前存在的块是否对应了阶，没对应就降阶，之后的就和前面的差不多，把状态全部都重置。
+    - 最后就是合并伙伴块了，首先判断不是最大阶，最大阶肯定不用合并，然后判断伙伴块是不是空闲块，并且大小和当前块一样大，如果满足条件，就取块头为左边的那个块的块头，把块的阶加1，大小也翻倍，插入对应的空闲链表，之后就继续处理其他空闲块了。
+
+### 测试样例：
+在本次测试中，我们分别测试了取页大小为1的块，取页大小为2的块，取页大小为3的块，以及取页大小为4096,8192的块，最后则尝试取了128MB全部内存，具体结果及分析如下：
+- 初始化：
+<img src="./picture/阶段0.png" style="width:10cm !important; height:7cm !important;">
+<p style="color:gray">初始化</p>
+
+首先对初始化的页表状态进行分析，发现块的起始页是839，证明在物理地址0x8034700之前的内存被用来储存系统自带的内容，实际上我们拥有的内存并没有128MB而是，31929*4kB大小的内存。分别有大小为1,8,16,32,128,1024,2048,4096,8192的块，符合伙伴系统的要求，最终结束地址为0x88000000，符合要求，证明我们的内存初始化是没有问题的。
+
+- 取小块测试：
+
+<img src="./picture/阶段1.png" style="width:10cm !important; height:7cm !important;">
+<p style="color:gray">取小块测试</p>
+
+我们取了大小为1,2,3的块，首先看到总页数确实少了6页，接着看剩余页阶数，发现取完之后空闲块部分少了阶为3的块，具体的取法是先取了阶为0的块。然后大小为2的块，发现没有阶为1，也没有阶为2的块，就拆分了阶为3的块为2个阶为2的块，再拆分成阶为1的块分配出去，3则是将阶为2的块用的还剩1，于是空闲块出现了一个阶为0的块和一个阶为1的块。
+  
+- 取大块测试：
+
+
+<img src="./picture/阶段2.png" style="width:10cm !important; height:7cm !important;">
+<p style="color:gray">取大块测试</p>
+
+我们取了大小为4096,8192的块，取完之后对应的块确实被占用了。
+
+- 放回块测试：
+<img src="./picture/阶段3.png" style="width:10cm !important; height:7cm !important;">
+<p style="color:gray">大小为1的块</p>
+<img src="./picture/阶段4.jpg" style="width:10cm !important; height:7cm !important;">
+<p style="color:gray">大小为2、3的块</p>
+<img src="./picture/阶段5.png" style="width:10cm !important; height:7cm !important;">
+<p style="color:gray">大小为4096的快</p>
+
+
+我们先放回大小为1的页，发现出现了两个阶为0的块，由于我们在取的时候分析了它俩其实并不相邻，所以不会合并，接着放回大小为2和3的块，发现在放回全部小块之后确实恢复成初始的样子了，证明我们的分配确实是正确的。然后我们放回了大块，结果当然也是正确的。
+
+- 取全部块测试：
+
+
+<img src="./picture/阶段6.png" style="width:10cm !important; height:7cm !important;">
+<p style="color:gray">取全部快测试</p>
+
+发现取块失败了，结果是预料之中的，因为我们确实没有128MB的空闲块，所以不可能取块成功，这也印证了前面的分析，至此我们的验证结束了，伙伴系统实现的非常正确。
+
+
+
+
+
+
+
 
 # Challenge2：SLUB 小对象分配器  
 ## 主要思想
@@ -390,7 +575,7 @@ best_fit_alloc_pages(size_t n) {                               // 申请 n 个�
 
 1.关键数据结构
 
-下面是三块“最核心”的结构，我直接贴源码加注释：
+下面是三块“最核心”的结构：
 
 ```c
 /* 每页一个 slab，放在页首。负责“这一页里”对象的统计与 free-list 头 */
@@ -427,6 +612,7 @@ struct big_hdr {
 <p style="color:gray">slab页内结构</p>
 
 当 objN “空闲”时：objN 的前 4 字节里存“下一个空闲对象的序号”；分配出去就归用户自由使用。
+
 3. 初始化流程 slub_init
 
 做两件事：确定 9 个 size-class；把 obj_stride 对齐好。
@@ -566,7 +752,7 @@ void slub_free(void *p) {
     assert(0);
 }
 ```
-7）大块路径（>2KB）
+7. 大块路径（>2KB）
 ```c
 static void *big_alloc(size_t n) {
     size_t need = n + sizeof(struct big_hdr) * 2;   // 双头
@@ -598,6 +784,236 @@ static void big_free_by_hdr(struct big_hdr *h) {
     free_pages(kva_to_page(base), np);
 }
 ```
+## 测试样例
+> 入口与环境：所有测试统一从 `run_slub_tests()` 调用，在内核初始化（物理内存管理完成后）执行一次。  
+> 运行产物：完整日志见 `slub_test.log`。  
+---
+### 总述
+
+- **T1 基础正确性**：对 8B~2048B 九个规格，各分配一批、写入校验、再释放。期待结果：对齐正确、无崩溃、`invariants ok`。  
+- **T2 大块路径**：分配并释放若干个 `> 2KB` 的块，命中“大块双头”路径。期待结果：释放不误判、`invariants ok`。  
+- **T3 碎片快照**：先大量 `128B`，再释放一半（制造 `partial`），再补 `129B(→256-class)`；对比三次统计。期待结果：`partial/full` 与 `frag` 按预期变化。  
+- **T4 过程展示**：对 `32B/128B/256B` 做“分配→释放一部分→再分配→清场”，分三次打点看 `partial/full` 在链表间移动。
+
+---
+### T1. 基础正确性（覆盖全部 size-class）
+
+**目的**：覆盖 9 个 size-class；检查基础分配/释放流程是否稳定（包含 8B 对齐检查和不变量自检）。
+
+**测试代码：**
+
+```c
+/* T1: 基础正确性（覆盖所有 class） */
+static void test_basic(void){
+    cprintf("[T1] basic begin\n");
+    size_t classes[] = {8,16,32,64,128,256,512,1024,2048};
+    for(int i=0;i<9;++i){
+        size_t n = classes[i];
+        const int CNT = 3 * 64;                // 每档压 192 个，确保跨多页
+        void *ptr[CNT];
+        for(int k=0;k<CNT;++k){
+            ptr[k]=kmalloc(n);
+            assert(ptr[k] && (((uintptr_t)ptr[k] & 7u)==0));  // 8B 对齐
+            memset(ptr[k], 0xA5, n);                          // 写固定模式便于排查
+        }
+        for(int k=0;k<CNT;++k) kfree(ptr[k]);                 // 全部释放
+    }
+    slub_check_invariants(1);                                 // 链表/索引一致性
+    cprintf("[T1] basic ok\n");
+}
+```
+**关键输出摘录（来自 slub_test.log）：**
+
+<img src="./picture/image.png" style="width:10cm !important; height:4cm !important;">
+<p style="color:gray">图3.1:关键输出摘录</p>
+
+### T2. 大块路径（> 2KB，双头 + 释放识别）
+
+**目的**：触发“大块”分配（>2KB 走页），验证双头标记在 kfree 时能正确识别并回收；结束时做不变量自检。
+**测试代码：**
+
+```c
+/* T2: 大块路径（>2KB 走页） */
+static void test_big(void){
+    cprintf("[T2] big begin\n");
+    size_t sizes[] = { 2049, 3000, 4096, 6000, 8191, 16384 };
+    void *p[16]={0};
+    for(int i=0;i<6;++i){
+        p[i]=kmalloc(sizes[i]);                  // 命中 big_alloc
+        assert(p[i]);
+        ((uint8_t*)p[i])[0]=0x5A;               // 动一下内存，证明可写
+    }
+    for(int i=0;i<6;++i) kfree(p[i]);           // 逐个释放，走 big_free_by_hdr
+    slub_check_invariants(1);
+    cprintf("[T2] big ok\n");
+}
+
+```
+**关键输出摘录（来自 slub_test.log）：**
+
+<img src="./picture/image-1.png" style="width:10cm !important; height:2cm !important;">
+<p style="color:gray">图3.2:大块路径输出结果节选</p>
+
+### T3.碎片快照（前后对比：128B → 半释放 → +129B）
+
+**目的**：观察 partial/full 与 internal_frag 的变化。
+
+**步骤**：
+1. 打初始快照；
+2. 分配 2000×128B;
+3. 释放一半（制造很多 partial，verbose=1 展示页内 inuse/free_head）；
+4. 再分配 1000×129B（落入 256-class）；
+5. 回收并做自检。
+
+**测试代码：**
+
+```c
+/* T3: 内碎片快照（128 vs 129） */
+static void test_fragmentation_snapshot(void){
+    cprintf("[T3] frag snapshot begin\n");
+    slub_dump_stats(0);                // 初始快照
+
+    // A. 纯 128B 占用
+    for(int i=0;i<2000;++i){
+        g_a[i]=kmalloc(128);
+        assert(g_a[i]!=NULL);
+    }
+    slub_dump_stats(0);                // 快照A
+
+    // B. 释放一半 -> 大量 partial
+    for(int i=0;i<2000; i+=2) { kfree(g_a[i]); g_a[i]=NULL; }
+    slub_dump_stats(1);                // 快照B（verbose 显示每个 slab 的 inuse/free_head）
+
+    // C. 再分配 1000 个 129B（跨到 256-class）
+    for(int i=0;i<1000;++i){
+        g_b[i]=kmalloc(129);
+        assert(g_b[i]!=NULL);
+    }
+    slub_dump_stats(0);                // 快照C（128+256 混合）
+
+    // D. 全部回收 + 自检
+    for(int i=0;i<2000;++i) if(g_a[i]) kfree(g_a[i]), g_a[i]=NULL;
+    for(int i=0;i<1000;++i)            kfree(g_b[i]), g_b[i]=NULL;
+    slub_check_invariants(1);
+    cprintf("[T3] frag snapshot ok\n");
+}
+
+```
+**关键输出摘录（来自 slub_test.log）：**
+<img src="./picture/image-2.png" style="width:10cm !important; height:7cm !important;">
+<p style="color:gray">图3.3:碎片快照输出摘录</p>
+
+### T4.过程展示（分配→半释放→再分配：链表在 partial/full 间移动）
+
+**目的**：用可视化的“三步走”看 partial/full 切换：
+
+- 第一步：一次性分配 N 个，可能出现 full；
+
+- 第二步：释放一部分，full 回流到 partial；
+
+- 第三步：再分一批，partial 再次被吃满。
+
+
+**测试代码：**
+
+```c
+/* 单档位的一轮“分配→半释放→再分配→清场”，中间三次打点 */
+static void stage_pattern(size_t sz, int N){
+    cprintf("  [T4] pattern size=%u begin\n",(unsigned)sz);
+    void *v[300];                      // 避免栈太大
+    int n = (N<=300?N:300);
+
+    // A. 初次分配
+    for(int i=0;i<n;++i){ v[i]=kmalloc(sz); assert(v[i]); }
+    slub_dump_stats(0);                // dump A
+
+    // B. 每 3 个释放 1 个 -> 制造 partial
+    for(int i=0;i<n;i+=3){ kfree(v[i]); v[i]=NULL; }
+    slub_dump_stats(1);                // dump B（verbose 展示 slab 细节）
+
+    // C. 再把空洞填回 N/3 个
+    int need = n/3, filled=0;
+    for(int i=0;i<n && filled<need;++i){
+        if(v[i]==NULL){ v[i]=kmalloc(sz); assert(v[i]); ++filled; }
+    }
+    slub_dump_stats(0);                // dump C
+
+    // 清场 + 自检
+    for(int i=0;i<n;++i) if(v[i]) kfree(v[i]);
+    slub_check_invariants(1);
+    cprintf("  [T4] pattern size=%u ok\n",(unsigned)sz);
+}
+
+/* 选三档：32B / 128B / 256B */
+static void test_pattern_showcase(void){
+    cprintf("[T4] pattern showcase begin\n");
+    stage_pattern(32,  180);
+    stage_pattern(128, 210);
+    stage_pattern(256, 150);
+    cprintf("[T4] pattern showcase ok\n");
+}
+
+```
+**关键输出摘录（来自 slub_test.log）：**
+<img src="./picture/image-4.png" style="width:10cm !important; height:4cm !important;">
+<p style="color:gray">图3.4:过程展示输出摘录</p>
+
+### 测试完整结束，通过所有测试
+<img src="./picture/image-5.png" style="width:10cm !important; height:4cm !important;">
+<p style="color:gray">图3.5:通过所有测试输出结果</p>
+
+
+# Challenge3：硬件的可用物理内存范围的获取方法
+
+在计算机中，由于历史原因和硬件设计需求，内存空间通常被分割成多个区域：
+- **可用RAM**：操作系统可以自由使用的空间；
+- **保留区**：被固件、硬件占用或映射的区域，操作系统不能使用；
+- **ACPI结构区**：用于存放ACPI 表的物理内存区间，存储系统参数；
+- 以及其他...
+在启动后，操作系统必须知道哪些物理地址可用、哪些物理地址被保留。但OS无法提前无法提前知道这些信息，只能通过一些方法来获取。
+
+为了解决这一问题，
+
+## 方法一：通过固件：
+本类方法通过在操作系统内核开始运行之前引导加载程序与早期代码和固件(BIOS或UEFI)通信，获取系统内存布局信息。
+### BIOS INT 15h E820 扩展内存查询功能：
+1. **应用场景**：传统的x86/x64架构的系统；
+2. **工作原理**：
+   - 引导加载程序调用 BIOS 的 INT 15h 中断，使用 E820 功能号请求内存映射信息;
+   - BIOS 响应请求并返回**内存映射表**;
+   - 内存映射表包含一系列内存区域描述符，每个描述符包含起始地址、长度和类型（可用、保留等）;
+   - 引导程序会反复调用该功能直到获取到整个内存映射；
+### UEFI GetMemoryMap() 函数：
+1. **应用场景**：现代x86/x64架构的系统，大部分ARM64、AArch64架构的系统；
+2. **工作原理**：
+   - 引导加载程序调用 UEFI 运行时服务 `GetMemoryMap()` 函数，请求内存映射信息;
+   - UEFI 运行时服务解析 ACPI 表，获取内存映射表;
+   - 内存映射表包含一系列内存区域描述符，每个描述符包含起始地址、长度和类型（可用、保留等）;
+   - 引导程序会反复调用`ExitBootServices`直到获取到整个内存映射；
+### ACPI
+1. **应用场景**：所有支持ACPI的系统；
+2. **工作原理**：
+   - ACPI 表中包含一系列内存区域描述符，每个描述符包含起始地址、长度和类型（可用、保留等）;
+   - 可以利用ACPI表中存储的信息来获取系统内存布局信息。
+   - 固件在初始化的时候会用特定标记划分空间，其中标记为`ACPI Reclaimable`的可以进行回收，而标记为`ACPI NVS`的部分是固件用于电源管理的，不能回收与分配。
+   - 此外ACPI还提供了SRAT表格，该表格明确列出所有的物理内存范围与其所属节点ID。
+## 方法二：通过非固件方案：
+### 物理内存探测
+1. **应用场景**：教学操作系统、嵌入式原型系统以及无固件支持的裸机系统等
+2. **工作原理**：
+   - 操作系统按(＾－＾)V逐步向物理地址写入魔法值(通常为0xdeadbeef)再读回验证，若读回值一致则认为该页存在且可用；若不一致则或触发异常则认为该页无效
+### 引导参数传递
+- **应用场景**：固件不提供物理接口(如无ACPI)时
+- **工作原理**：
+  - Bootloader 在启动 OS 前，提前探测内存（可通过内存控制器、配置寄存器或探测法），然后将结果通过约定方式传递给内核。操作系统只需解析该结构体，无需再探测。
+### 硬编码内存范围
+- **应用场景**：教学实验仿真平台(如QEMU)
+- **工作原理**：
+  - 在编译的时候通过链接脚本或头文件直接写死内存起始地址与大小，操作系统直接调用这些常量初始化内存管理。无需探测。
+### 异常驱动边界探测
+- **应用场景**：极简内核，内存连续只需知道上限的场景。
+- **工作原理**：OS从已知起始地址开始，不断向后尝试分配内存，直到触发异常或超出边界。
+
 
 # 本实验中重要的知识点
 
@@ -659,9 +1075,9 @@ static void big_free_by_hdr(struct big_hdr *h) {
 ### 虚拟内存管理与分页机制的创立
 1. 分页机制的启动：
    - **核心任务**：建立页表，并最终启动分页机制。
-   - **硬件交互**:OS 建立好页表后，CPU 的 **MMU（内存管理单元）**将根据配置，把页表项读入 **TLB（转换后备缓冲区）**中.
+   - **硬件交互**:OS 建立好页表后，CPU 的 MMU（内存管理单元）将根据配置，把页表项读入 TLB（转换后备缓冲区）中.
 2. 地址映射的实现：
-   - **对应关系**： 页表项描述了**虚拟页（Page）与物理页帧（Page Frame）**的对应关系。
+   - **对应关系**： 页表项描述了虚拟页（Page）与物理页帧（Page Frame）的对应关系。
    - **CPU 操作**： CPU 依靠 TLB/页表完成对内存的读、写和执行操作时的地址转换。 。
 
 ##  页表项（PTE）的结构与功能
@@ -752,7 +1168,7 @@ static void big_free_by_hdr(struct big_hdr *h) {
 
 
 
-## 物理地址访问模式虚拟地址访问模式**
+## 物理地址访问模式虚拟地址访问模式
 
 ### 切换前的系统状态与核心问题
 
