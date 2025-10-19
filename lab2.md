@@ -549,13 +549,6 @@ static void buddy_free_pages(struct Page *base, size_t n) {
 
 发现取块失败了，结果是预料之中的，因为我们确实没有128MB的空闲块，所以不可能取块成功，这也印证了前面的分析，至此我们的验证结束了，伙伴系统实现的非常正确。
 
-
-
-
-
-
-
-
 # Challenge2：SLUB 小对象分配器  
 ## 主要思想
 
